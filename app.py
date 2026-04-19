@@ -31,11 +31,17 @@ def scan():
     match_result = match_card(ocr_results, game="onepiece")
     
     matched_card_id = None
-    match_score = 0
+    match_score = 0.0
+    Min_score = 70.0
     
-    if match_result["best_match"]:
-        matched_card_id = match_result["best_match"]["card_id"]
-        match_score = match_result["best_match"]["score"]
+    if match_result is not None and match_result.get("best_match") is not None:
+        matched_card_id = match_result["best_match"].get("card_id")
+        match_score = match_result["best_match"].get("score", 0.0)
+ 
+    best = match_result.get("best_match")
+    
+    if best is not None and best.get("score", 0.0) < Min_score:
+        match_result["best_match"] = None
         
     save_scan(
         str(image_path),
