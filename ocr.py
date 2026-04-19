@@ -11,19 +11,16 @@ def normalize(text):
 	return text.strip()
 
 def extract_text(image_path):
-	result = reader.readText(image_path)
-	cleaned = []
+	result = reader.readtext(image_path)
+	output = []
 	
-	for detection in result:
-		text = detection[1]
-		confidence = detection[2]
-		cleaned.append({
-			"raw": text,
-			"cleaned": normalize(text),
-			"confidence": float(confidence)
+	for items in result:
+		output.append({
+			"raw": items[1],
+			"cleaned": normalize(items[1]),
+			"confidence": float(items[2])
 		})
-	return cleaned
+	return output
 	
 if __name__ == "__main__":
-	output = extract_text("test.jpg")
-	print(output)
+	print(extract_text("test.jpg"))
