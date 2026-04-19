@@ -24,7 +24,7 @@ def save_scan(image_path, raw_ocr_text, normalized_ocr_text, matched_card_id, ma
                     image_path,
                     raw_ocr_text,
                     normalized_ocr_text,
-                    matched_card_id.
+                    matched_card_id,
                     match_score,
                     scan_time
                 ) VALUES (?, ?, ?, ?, ?, datetime('now'))
