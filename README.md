@@ -1,219 +1,210 @@
 # Raspberry Pi Trading Card Scanner Backend
 
-This project is a Raspberry Pi 4 backend for identifying trading cards from JPEG images posted by an ESP32-CAM over WiFi. It supports Pokemon and One Piece cards through a provider abstraction, stores successful matches locally in `carddata.db`, and shows the latest scan state on a Flask-rendered UI suitable for a Freenove Raspberry Pi touchscreen.
+A Raspberry Pi 4 backend that identifies a trading card from a JPEG posted by an
+ESP32-CAM and returns its **recent-sales-derived price** (real completed TCGplayer
+sale prices via [TCGAPIs](https://tcgapis.com)). It supports Pokémon and One Piece
+through a provider abstraction, caches everything it can locally in SQLite +
+on-disk tiers, and shows the latest scan on a Flask-rendered touchscreen page.
 
-## How The System Works
+This is a modular, edge-CV rebuild. The pipeline is **OpenCV-first**: it leads with
+cheap, discriminative signals (collector-number OCR + perceptual hashing) and only
+falls back to heavier work (EasyOCR, remote lookups, ORB) when needed.
 
-1. The ESP32-CAM sends a JPEG to `POST /scan`.
-2. Flask validates that the upload is a JPEG and saves it under `data/scans/` with a UTC timestamp.
-3. A lightweight internal scan worker runs the heavy pipeline.
-4. OpenCV preprocesses the image and tries ORB feature matching against cards already cached in `carddata.db`.
-5. If the local match confidence is at least `LOCAL_MATCH_THRESHOLD`, the result returns immediately and OCR/API lookup is skipped.
-6. If local matching is weak, EasyOCR extracts card text from the image.
-7. OCR text is cleaned into search queries and sent to all configured providers: Pokemon, One Piece, and optional mock.
-8. The top 20 normalized candidates are collected, candidate images are cached under `data/cache/candidate_images/`, and OpenCV ranks them with the same ORB matcher.
-9. If the best remote candidate reaches `REMOTE_MATCH_THRESHOLD`, it is saved to SQLite with cached image and descriptors for faster future local matching.
-10. Every scan attempt is written to `scan_history`.
-11. The display adapter updates `data/cache/display_state.json`, and `/display` renders it for the Freenove touchscreen.
-12. `POST /scan` returns JSON with match status, name, game, set, price, confidence, source, OCR text, image path, and DB id.
+---
 
-## 64GB microSD Storage Strategy
+## What the pipeline does (in order)
 
-The scanner uses SQLite for permanent metadata and file indexes, but not for full-size card image BLOBs. Full images stay on disk where they can be deduplicated, pruned, replaced, or rebuilt without bloating `carddata.db`. SQLite stores paths, hashes, provider IDs, latest prices, compact price history, scan history, and cache records.
+1. **Upload** — ESP32-CAM sends a JPEG to `POST /scan`. Flask validates size + JPEG
+   magic bytes and saves it (hash-deduplicated) under `data/scans/`.
+2. **Detect & warp** (`card_detector`) — find the card's quadrilateral, perspective-
+   correct it to a canonical upright image, and crop the **title** and **collector-
+   number** regions. Everything downstream sees a clean, flat card.
+3. **Local match first** (`image_matcher`) — perceptual hash (pHash) of the warped
+   card is compared (Hamming distance) against an **in-memory index** of known cards.
+   Close hit → done, no OCR or network. This is the OpenCV-first, O(N)-cheap path.
+4. **OCR fallback** (`ocr_service`, EasyOCR) — only if the local match is weak. OCR
+   runs on the small title/number crops, not the whole image, and the model is loaded
+   **once** at startup.
+5. **Normalize** (`normalizer`, RapidFuzz) — clean OCR text, extract/repair the
+   collector number, fuzzy-match names, and de-duplicate candidates.
+6. **Identity providers** (`providers/identity`) — query TCGAPIs (per game) for
+   candidate cards.
+7. **Rank** (`candidate_ranker`) — score each candidate:
+   `0.5·number_exact + 0.3·name_fuzz + 0.2·image_score`. A misread number can't win
+   alone — it must be corroborated by name/image.
+8. **Price** (`pricing_service` → `providers/price`) — for the winning card, derive
+   the price from **real recent sales** (`/api/v2/sales-history/:productId`).
+9. **Persist & learn** — a confident remote match is written to SQLite with its pHash
+   + ORB descriptors, so the **next** scan of that card resolves locally in step 3.
+10. **History + display** — every attempt is written to `scan_history`; the touchscreen
+    state file is updated and `/display` renders it.
 
-Storage tiers:
+---
 
-| Tier | Location | Purpose | Retention |
+## The matching cascade (and its guard rails)
+
+Leads with the cheap signal, escalates only as needed, stops on confidence:
+
+| Pass | Signal | Cost | Role |
 | --- | --- | --- | --- |
-| Tier 1 | `carddata.db` | Permanent card metadata, provider IDs, hashes, latest price, scan history, cache index | Long-lived |
-| Tier 2 | `data/descriptors/` | ORB descriptors for fast local matching | Kept longer than images, rebuildable |
-| Tier 3 | `data/cache/card_images/` | Full-size cached images for known/recent/frequent cards | LRU capped |
-| Tier 4 | `data/cache/candidate_temp/` | Temporary remote API candidate downloads | TTL plus size cap |
+| 1 | **Collector-number OCR** (+ RapidFuzz) | ~free | Most discriminative; resolves most modern cards deterministically |
+| 2 | **pHash** vs in-memory index | microseconds, O(N) | "Have I seen this exact card before?" — local, offline hits |
+| 3 | **ORB** over the pHash top-K | seconds | **Tie-break only** on a small shortlist, never the whole DB |
+| 4 | **Name OCR → provider search → rank** | network | Fallback when the number is unreadable |
 
-Recommended conservative budget for a 64GB card:
+Two failure modes are handled explicitly (the flaw check you asked about):
 
-| Area | Default cap | Why |
-| --- | ---: | --- |
-| Free space reserve | 20GB | Leaves room for OS updates, package cache, swap, and SD wear leveling |
-| `data/scans/` originals | 1GB | Keeps recent evidence without archiving every ESP32-CAM upload forever |
-| `data/cache/card_images/` | 2GB | Enough for thousands of card images while staying bounded |
-| `data/cache/candidate_temp/` | 512MB | Remote candidates are short-lived and easy to redownload |
-| `data/descriptors/` | 256MB | ORB descriptors are small and valuable for fast repeat matches |
-| `logs/` | 128MB | Rotating logs only; avoid verbose disk logging |
-| `carddata.db` warning | 256MB | Metadata should remain compact; investigate if it grows past this |
+- **A misread collector number can confidently point at the wrong card.** So a number
+  hit does **not** win on its own — `candidate_ranker` still folds in name-fuzz and
+  image score before accepting (`REMOTE_MATCH_THRESHOLD`).
+- **pHash of a lit/foil scan drifts from clean art.** So pHash uses a **Hamming-distance
+  threshold** (`PHASH_MAX_DISTANCE`), not exact match, and ORB re-ranks the shortlist
+  when pHash is ambiguous.
 
-These defaults keep scanner-owned storage near 4GB while leaving a healthy amount of free space on a 64GB microSD card.
+pHash is computed natively with OpenCV's DCT (no extra `imagehash` dependency).
 
-## Eviction And Retention
+---
 
-Eviction order:
+## Price = recent sales, not "market price"
 
-1. Expired Tier 4 candidate temp files are deleted first because they are transient API downloads.
-2. Old unpinned uploaded scan originals are pruned after `SCAN_ORIGINAL_TTL_DAYS`.
-3. Full-size Tier 3 card images are evicted by LRU when `IMAGE_CACHE_MAX_BYTES` is exceeded.
-4. Debug scan copies are kept longer than originals but are lower quality and also TTL managed.
-5. Tier 2 descriptors are kept longest because they are small and speed up local matching. They are still rebuildable from cached or redownloaded card images.
+Your requirement was the *most recent sold price*. TCGAPIs exposes a real completed-
+sales feed, so `providers/price/tcgapis_price.py` derives the value from actual sales:
 
-Default retention:
+- `GET /api/v2/sales-history/:productId` → recent completed sales.
+- `PRICE_STRATEGY` chooses how to reduce them:
+  - `last_sale` — the single most recent sale
+  - `median_recent` — median of the last `PRICE_RECENT_SALES_WINDOW` sales (**default**, robust to outliers)
+  - `mean_recent` — mean of the last N sales
+- If sales history is empty and `PRICE_FALLBACK_TO_MARKET=true`, it falls back to the
+  algorithmic market price (`/api/v2/prices/:productId`). The quote records its
+  `basis` (e.g. `median_recent(10 sales)`) and `as_of` date so the UI never implies a
+  live last-sale when it's really a fallback.
 
-- Original uploaded scans: 14 days.
-- Lower-resolution debug scan copies: 45 days.
-- Candidate temp downloads: 72 hours.
-- API query cache: 24 hours.
-- Price refresh: no more than once every 24 hours by default.
+> **Plan note:** on TCGAPIs, `sales-history` and `prices` require the **Business** tier
+> or higher; the catalog (identity) is available from **Hobby**. Set `TCGAPIS_API_KEY`
+> in `.env`. With no key, the app runs entirely on the built-in **mock** provider so you
+> can develop and test offline.
 
-Permanent data:
+---
 
-- Normalized card metadata.
-- Provider source and API ID.
-- Latest known price and compact price history.
-- Scan history metadata.
-- File hashes and cache indexes.
+## Project structure
 
-Rebuildable data:
-
-- ORB descriptor files.
-- Full-size cached card images.
-- Temporary candidate downloads.
-- Debug scan copies.
-- Uploaded scan JPEGs after the retention window.
-
-If cache folders are deleted but `carddata.db` remains, startup maintenance removes stale cache records, keeps card metadata, and lazily rebuilds descriptors when a source image is available. If source images are gone, the next OCR/API match can redownload and recache the card art.
-
-## SD-Card-Friendly Writes
-
-The backend avoids making the microSD card a dumping ground:
-
-- Repeated uploads are hash-deduplicated before a new scan file is written.
-- Candidate downloads are short-lived and cleaned by TTL.
-- Confirmed remote art is copied once into the reusable image cache.
-- Descriptor files are generated lazily and reused for local matching.
-- SQLite stores compact metadata, not large image BLOBs.
-- Logs use a rotating file handler; keep `DEBUG=false` for normal use.
-- Transient files that do not need reboot survival can be pointed at a RAM-backed path by setting `CANDIDATE_TEMP_DIR=/tmp/card-scanner-candidates`.
-
-Database writes are kept practical and small: one scan history row per scan, one card upsert for confident remote matches, and price history only when the observed price changes. For a single-scanner Pi workload, this is simpler and safer than introducing a heavier batching service.
-
-## Why Flask Plus A Small Worker
-
-Flask remains the API and UI layer because it is simple and reliable on a Raspberry Pi 4. OCR, remote API calls, image downloads, and matching many candidates can take seconds and use noticeable CPU. Instead of adding Redis, Celery, or another service, this project uses `SimpleJobService`, an in-process `ThreadPoolExecutor`.
-
-The worker/service:
-
-- `scan-worker`: runs the full image-processing pipeline after Flask has saved the JPEG.
-- Purpose: keep heavy OCR, provider fetches, candidate downloads, and OpenCV matching out of the route handler.
-- Why it exists: a Pi 4 can become sluggish if several scans run at once, so the default `SCAN_WORKERS=1` serializes scan work.
-- Tasks that remain in Flask: upload validation, file saving, health checks, job status, history endpoint, and touchscreen UI rendering.
-
-By default, `POST /scan` waits for the worker result so the ESP32-CAM receives the final JSON response. Add `?async=1` or set `BLOCKING_SCAN_RESPONSE=false` to return a queued `job_id` and poll `/jobs/<job_id>`.
-
-## Project Structure
-
-```text
-app.py
-config.py
+```
+app.py                      Flask app factory: wires config -> repo -> providers -> services -> pipeline
+config.py                   Typed config, loaded once from .env
 requirements.txt
-README.md
 .env.example
 database/
-  init_db.py
-  schema.sql
-  repository.py
-  seed_sample_cards.py
-services/
-  image_matcher.py
-  ocr_service.py
-  card_lookup_service.py
-  candidate_ranker.py
-  scan_pipeline.py
-  display_service.py
-  cache_service.py
-  job_service.py
-  cache_policy.py
-  descriptor_store.py
-  storage_manager.py
-  maintenance_service.py
+  schema.sql                cards, card_images, scan_history, api_cache, storage_files, price_history (WAL)
+  repository.py             the ONLY module that touches SQL (see Issue #7)
+  init_db.py                create the DB
+  seed_sample_cards.py      optional sample rows
 providers/
-  base_provider.py
-  pokemon_provider.py
-  onepiece_provider.py
-  mock_provider.py
+  base.py                   CandidateCard, PriceQuote, IdentityProvider, PriceProvider
+  tcgapis_client.py         shared HTTP client (x-api-key, retries, timeouts)
+  identity/                 tcgapis_identity.py, mock_identity.py
+  price/                    tcgapis_price.py (recent-sales), mock_price.py
+services/
+  card_detector.py          find + perspective-warp the card, crop title/number
+  ocr_service.py            EasyOCR wrapper (loaded once, ROI-only)
+  normalizer.py             RapidFuzz cleaning / number extraction / fuzzy matching
+  image_matcher.py          native pHash + ORB tie-break cascade
+  candidate_ranker.py       number+name+image -> confidence
+  pricing_service.py        recent-sales price with a TTL cache
+  scan_pipeline.py          the orchestrator
+  job_service.py            SimpleJobService (ThreadPoolExecutor, 1 worker, task timeout)
+  storage_manager.py        hash-dedupe saves, tiered dirs
+  cache_policy.py           TTL + LRU eviction helpers
+  descriptor_store.py       ORB .npz persistence
+  display_service.py        writes display_state.json
+  maintenance_service.py    bounded startup cleanup
 routes/
-  scan_routes.py
-  ui_routes.py
+  scan_routes.py            POST /scan, GET /jobs/<id>, /history, /health
+  ui_routes.py              GET /display, GET /
 utils/
-  image_utils.py
-  text_utils.py
-  logger.py
-templates/
-  display.html
-  result.html
-static/
-  styles.css
-data/
-  scans/
-  cache/
-    card_images/
-    candidate_temp/
-    scan_debug/
-  descriptors/
-tests/
-  test_image_matcher.py
-  test_text_utils.py
-  test_candidate_ranker.py
-  test_pipeline.py
+  image_utils.py, logger.py
+templates/  display.html, result.html
+static/     styles.css
+tests/      test_normalizer.py, test_image_matcher.py, test_candidate_ranker.py, test_pipeline.py
+data/       scans/  cache/{card_images,candidate_temp,scan_debug}/  descriptors/
 ```
 
-## Raspberry Pi 4 Setup
+---
 
-Use Python 3.11 or newer. On Raspberry Pi OS, install system packages first:
+## Raspberry Pi 4 setup
+
+Python 3.11+ recommended. Install system libs, then the Python deps:
 
 ```bash
 sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3-pip libgl1 libglib2.0-0
-```
+sudo apt install -y python3-venv python3-pip libgl1 libglib2.0-0
 
-Then set up the project:
-
-```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt      # EasyOCR pulls in torch -- this is the slow one
+
+cp .env.example .env                 # then edit: add TCGAPIS_API_KEY, adjust thresholds
 python database/init_db.py
-python database/seed_sample_cards.py
-python app.py
+python database/seed_sample_cards.py # optional
+python app.py                        # serves on http://0.0.0.0:5000
 ```
 
-The API will listen on `http://0.0.0.0:5000` by default.
+`opencv-python-headless` is used deliberately (no GUI libs). EasyOCR is the heaviest
+install; if you want it lighter later, `ocr_service.py` is the only file to change.
 
-## Configuration
+---
 
-Copy `.env.example` to `.env` and adjust values as needed.
+## Configuration (`.env`)
 
-Important settings:
+Key settings (full list in `.env.example`):
 
-- `LOCAL_MATCH_THRESHOLD`: confidence needed to trust the local SQLite/descriptor match.
-- `REMOTE_MATCH_THRESHOLD`: confidence needed to trust a remote provider candidate.
-- `SCAN_WORKERS`: default `1`, recommended for Raspberry Pi 4.
-- `SCANS_MAX_BYTES`: default `1GB`.
-- `IMAGE_CACHE_MAX_BYTES`: default `2GB`.
-- `CANDIDATE_TEMP_MAX_BYTES`: default `512MB`.
-- `DESCRIPTORS_MAX_BYTES`: default `256MB`.
-- `MIN_FREE_SPACE_BYTES`: default `20GB`.
-- `SCAN_ORIGINAL_TTL_DAYS`: default `14`.
-- `CANDIDATE_TEMP_TTL_HOURS`: default `72`.
-- `ENABLE_MOCK_PROVIDER`: keep `true` for offline development.
-- `POKEMON_TCG_API_KEY`: optional for Pokemon TCG API.
-- `ONEPIECE_API_BASE_URL` and `ONEPIECE_API_KEY`: configurable because One Piece APIs vary by provider.
-- `OCR_ENABLED`: set `false` to skip EasyOCR during quick development.
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `LOCAL_MATCH_THRESHOLD` | `0.72` | confidence to trust a local pHash/ORB match |
+| `REMOTE_MATCH_THRESHOLD` | `0.60` | confidence to trust a remote candidate |
+| `PHASH_MAX_DISTANCE` | `10` | max Hamming distance (of 64 bits) for a pHash hit |
+| `ORB_SHORTLIST` | `5` | how many pHash candidates ORB re-ranks |
+| `OCR_ENABLED` | `true` | set false to skip EasyOCR during quick dev |
+| `TCGAPIS_API_KEY` | *(blank)* | your key; blank → mock provider |
+| `PRICE_STRATEGY` | `median_recent` | `last_sale` \| `median_recent` \| `mean_recent` |
+| `PRICE_RECENT_SALES_WINDOW` | `10` | sales considered for median/mean |
+| `PRICE_REFRESH_MIN_HOURS` | `24` | don't re-fetch a card's price more often than this |
+| `SCAN_WORKERS` | `1` | keep at 1 on a Pi 4 |
+| `MAX_UPLOAD_BYTES` | `12000000` | reject larger uploads (DoS guard) |
 
-If no remote API credentials are supplied, the project still runs with `MockProvider`.
+---
 
-## ESP32-CAM Upload
+## API
 
-The scanner accepts either a multipart file field named `image` or a raw `image/jpeg` request body.
+- `GET /health` — status, card count, index size, DB size, whether a provider key is set.
+- `POST /scan` — body is raw `image/jpeg` **or** multipart field `image`. Returns the
+  final JSON result by default; add `?async=1` (or set `BLOCKING_SCAN_RESPONSE=false`)
+  to get a `job_id` and poll `GET /jobs/<job_id>`.
+- `GET /history?limit=25` — recent scan rows.
+- `GET /display` — touchscreen UI (auto-refresh). `GET /` — status page.
 
-Raw JPEG:
+`POST /scan` result:
+
+```json
+{
+  "matched": true,
+  "card_name": "Pikachu",
+  "game": "pokemon",
+  "set_name": "Base Set",
+  "collector_number": "58/102",
+  "price": 3.60,
+  "currency": "USD",
+  "price_basis": "median_recent(10 sales)",
+  "price_as_of": "2026-07-01T00:00:00Z",
+  "confidence": 0.86,
+  "source": "remote_api",
+  "match_method": "ocr+provider",
+  "ocr_text": "Pikachu\n58/102",
+  "db_id": 123
+}
+```
+
+### ESP32-CAM upload (raw JPEG)
 
 ```cpp
 HTTPClient http;
@@ -224,575 +215,68 @@ String response = http.getString();
 http.end();
 ```
 
-Multipart uploads also work if your ESP32-CAM firmware sends `form-data` with the field name `image`.
-
-## Test With Curl
-
-Raw JPEG body:
+### Test with curl
 
 ```bash
-curl -X POST \
-  -H "Content-Type: image/jpeg" \
-  --data-binary @sample-card.jpg \
+curl -X POST -H "Content-Type: image/jpeg" --data-binary @sample-card.jpg \
   http://RASPBERRY_PI_IP:5000/scan
 ```
 
-Multipart:
+---
 
-```bash
-curl -X POST \
-  -F "image=@sample-card.jpg;type=image/jpeg" \
-  http://RASPBERRY_PI_IP:5000/scan
-```
-
-Async mode:
-
-```bash
-curl -X POST \
-  -H "Content-Type: image/jpeg" \
-  --data-binary @sample-card.jpg \
-  "http://RASPBERRY_PI_IP:5000/scan?async=1"
-
-curl http://RASPBERRY_PI_IP:5000/jobs/JOB_ID
-```
-
-## Freenove Touchscreen Display
-
-The Freenove monitor is treated as the Pi display. Start the Flask server, then open Chromium on the Pi:
+## Touchscreen (Freenove)
 
 ```bash
 chromium-browser --kiosk http://localhost:5000/display
 ```
 
-The `/display` page auto-refreshes and shows:
+`/display` auto-refreshes and shows the card name, game, set, price (with its basis and
+as-of date), confidence, and match source (`local_db` / `remote_api`).
 
-- card name
-- Pokemon or One Piece
-- set name
-- price
-- confidence
-- match source, such as `local_db` or `remote_api`
-
-The backend updates the display after success, low-confidence results, OCR failures, and pipeline errors.
-
-## API Endpoints
-
-### `GET /health`
-
-Returns:
-
-```json
-{
-  "ok": true,
-  "service": "raspi-card-scanner"
-}
-```
-
-### `POST /scan`
-
-Returns a final result by default:
-
-```json
-{
-  "matched": true,
-  "card_name": "Pikachu",
-  "game": "pokemon",
-  "set_name": "Base Set",
-  "price": 12.34,
-  "currency": "USD",
-  "confidence": 0.67,
-  "source": "local_db",
-  "ocr_text": "",
-  "image_path": "data/scans/scan_20260502T120000000000Z.jpg",
-  "db_id": 123
-}
-```
-
-### `GET /jobs/<job_id>`
-
-Returns queued/running/finished/failed state for async scans.
-
-### `GET /history`
-
-Returns recent scan history rows.
-
-### `GET /display`
-
-Touchscreen UI for the latest scan state.
-
-## Provider Layer
-
-All providers return the same `CandidateCard` schema:
-
-- `game`
-- `card_name`
-- `set_name`
-- `collector_number`
-- `rarity`
-- `image_url`
-- `price`
-- `currency`
-- `source`
-- `api_id`
-
-Included providers:
-
-- `PokemonProvider`: uses the Pokemon TCG API.
-- `OnePieceProvider`: uses a configurable APITCG-compatible endpoint.
-- `MockProvider`: works offline and powers tests/development.
+---
 
 ## Database
 
-SQLite database file: `carddata.db`.
+SQLite file `carddata.db` (WAL mode). Full-size images live on disk; SQLite holds
+compact metadata, the pHash index, prices, and history:
 
-Tables:
+- `cards` — normalized card, `api_id`, `phash`, descriptor/image paths, latest price.
+- `card_images`, `storage_files` — on-disk file index (tier, hash, size, LRU, expiry).
+- `scan_history` — every attempt (matched or not) with confidence + source.
+- `price_history` — appended only when a price changes.
+- `api_cache` — provider query cache.
 
-- `cards`: normalized card records and cached descriptor paths.
-- `card_images`: image references for known cards.
-- `scan_history`: every attempt, including failures and confidence.
-- `api_cache`: provider query cache to reduce network calls.
-- `storage_files`: tier, path, hash, size, expiry, LRU access time, and pinning metadata.
-- `price_history`: compact price observations only when a price changes.
+The **repository is the single SQL owner** (repo Issue #7), and the pipeline keeps an
+**in-memory index** so a scan compares hashes in RAM and only writes to SQLite on a new
+match — not a per-scan DB scan.
 
-Schema choices:
-
-- Full-size images are not stored as SQLite BLOBs.
-- ORB descriptors are separate `.npz` files, indexed by path in SQLite.
-- Provider-specific raw metadata is stored in `metadata_json` for expandability.
-- New games reuse the same `game`, `api_source`, `api_id`, `storage_files`, and `metadata_json` model.
-
-Price strategy:
-
-- `cards.price` and `cards.currency` hold the latest known value for display.
-- `price_history` stores compact observations only when the value changes.
-- Provider/API prices should be refreshed during OCR/API lookup or by a future scheduled refresh, not on every local DB match.
-- `PRICE_REFRESH_MIN_HOURS=24` is a good default to avoid noisy writes and excessive API calls.
-
-## Startup Maintenance
-
-`MaintenanceService` runs at startup and performs a small bounded cleanup:
-
-- validates all storage directories;
-- removes storage index rows for missing files;
-- prunes expired candidate temp files;
-- prunes old uploaded scan originals;
-- enforces LRU size caps;
-- rebuilds a small number of missing descriptors from available local images.
-
-The scan pipeline interacts with storage like this:
-
-1. `/scan` saves the JPEG through `StorageManager`, which hashes and deduplicates repeated uploads.
-2. Local matching loads existing descriptors from `DescriptorStore`.
-3. OCR/API candidates are downloaded into `candidate_temp`.
-4. The best confident remote match is promoted into `card_images`.
-5. ORB descriptors are generated lazily and stored in `data/descriptors/`.
-6. SQLite records card metadata, file paths, hashes, latest price, scan history, and cache index rows.
+---
 
 ## Testing
-
-Run:
 
 ```bash
 pytest
 ```
 
-The tests use temporary files and the mock provider. They do not require network access or EasyOCR.
-# Raspberry Pi Trading Card Scanner Backend
-
-This project is a Raspberry Pi 4 backend for identifying trading cards from JPEG images posted by an ESP32-CAM over WiFi. It supports Pokemon and One Piece cards through a provider abstraction, stores successful matches locally in `carddata.db`, and shows the latest scan state on a Flask-rendered UI suitable for a Freenove Raspberry Pi touchscreen.
-
-## How The System Works
-
-1. The ESP32-CAM sends a JPEG to `POST /scan`.
-2. Flask validates that the upload is a JPEG and saves it under `data/scans/` with a UTC timestamp.
-3. A lightweight internal scan worker runs the heavy pipeline.
-4. OpenCV preprocesses the image and tries ORB feature matching against cards already cached in `carddata.db`.
-5. If the local match confidence is at least `LOCAL_MATCH_THRESHOLD`, the result returns immediately and OCR/API lookup is skipped.
-6. If local matching is weak, EasyOCR extracts card text from the image.
-7. OCR text is cleaned into search queries and sent to all configured providers: Pokemon, One Piece, and optional mock.
-8. The top 20 normalized candidates are collected, candidate images are cached under `data/cache/candidate_images/`, and OpenCV ranks them with the same ORB matcher.
-9. If the best remote candidate reaches `REMOTE_MATCH_THRESHOLD`, it is saved to SQLite with cached image and descriptors for faster future local matching.
-10. Every scan attempt is written to `scan_history`.
-11. The display adapter updates `data/cache/display_state.json`, and `/display` renders it for the Freenove touchscreen.
-12. `POST /scan` returns JSON with match status, name, game, set, price, confidence, source, OCR text, image path, and DB id.
-
-## 64GB microSD Storage Strategy
-
-The scanner uses SQLite for permanent metadata and file indexes, but not for full-size card image BLOBs. Full images stay on disk where they can be deduplicated, pruned, replaced, or rebuilt without bloating `carddata.db`. SQLite stores paths, hashes, provider IDs, latest prices, compact price history, scan history, and cache records.
-
-Storage tiers:
-
-| Tier | Location | Purpose | Retention |
-| --- | --- | --- | --- |
-| Tier 1 | `carddata.db` | Permanent card metadata, provider IDs, hashes, latest price, scan history, cache index | Long-lived |
-| Tier 2 | `data/descriptors/` | ORB descriptors for fast local matching | Kept longer than images, rebuildable |
-| Tier 3 | `data/cache/card_images/` | Full-size cached images for known/recent/frequent cards | LRU capped |
-| Tier 4 | `data/cache/candidate_temp/` | Temporary remote API candidate downloads | TTL plus size cap |
-
-Recommended conservative budget for a 64GB card:
-
-| Area | Default cap | Why |
-| --- | ---: | --- |
-| Free space reserve | 20GB | Leaves room for OS updates, package cache, swap, and SD wear leveling |
-| `data/scans/` originals | 1GB | Keeps recent evidence without archiving every ESP32-CAM upload forever |
-| `data/cache/card_images/` | 2GB | Enough for thousands of card images while staying bounded |
-| `data/cache/candidate_temp/` | 512MB | Remote candidates are short-lived and easy to redownload |
-| `data/descriptors/` | 256MB | ORB descriptors are small and valuable for fast repeat matches |
-| `logs/` | 128MB | Rotating logs only; avoid verbose disk logging |
-| `carddata.db` warning | 256MB | Metadata should remain compact; investigate if it grows past this |
-
-These defaults keep scanner-owned storage near 4GB while leaving a healthy amount of free space on a 64GB microSD card.
-
-## Eviction And Retention
-
-Eviction order:
-
-1. Expired Tier 4 candidate temp files are deleted first because they are transient API downloads.
-2. Old unpinned uploaded scan originals are pruned after `SCAN_ORIGINAL_TTL_DAYS`.
-3. Full-size Tier 3 card images are evicted by LRU when `IMAGE_CACHE_MAX_BYTES` is exceeded.
-4. Debug scan copies are kept longer than originals but are lower quality and also TTL managed.
-5. Tier 2 descriptors are kept longest because they are small and speed up local matching. They are still rebuildable from cached or redownloaded card images.
-
-Default retention:
-
-- Original uploaded scans: 14 days.
-- Lower-resolution debug scan copies: 45 days.
-- Candidate temp downloads: 72 hours.
-- API query cache: 24 hours.
-- Price refresh: no more than once every 24 hours by default.
-
-Permanent data:
-
-- Normalized card metadata.
-- Provider source and API ID.
-- Latest known price and compact price history.
-- Scan history metadata.
-- File hashes and cache indexes.
-
-Rebuildable data:
-
-- ORB descriptor files.
-- Full-size cached card images.
-- Temporary candidate downloads.
-- Debug scan copies.
-- Uploaded scan JPEGs after the retention window.
-
-If cache folders are deleted but `carddata.db` remains, startup maintenance removes stale cache records, keeps card metadata, and lazily rebuilds descriptors when a source image is available. If source images are gone, the next OCR/API match can redownload and recache the card art.
-
-## SD-Card-Friendly Writes
-
-The backend avoids making the microSD card a dumping ground:
-
-- Repeated uploads are hash-deduplicated before a new scan file is written.
-- Candidate downloads are short-lived and cleaned by TTL.
-- Confirmed remote art is copied once into the reusable image cache.
-- Descriptor files are generated lazily and reused for local matching.
-- SQLite stores compact metadata, not large image BLOBs.
-- Logs use a rotating file handler; keep `DEBUG=false` for normal use.
-- Transient files that do not need reboot survival can be pointed at a RAM-backed path by setting `CANDIDATE_TEMP_DIR=/tmp/card-scanner-candidates`.
-
-Database writes are kept practical and small: one scan history row per scan, one card upsert for confident remote matches, and price history only when the observed price changes. For a single-scanner Pi workload, this is simpler and safer than introducing a heavier batching service.
-
-## Why Flask Plus A Small Worker
-
-Flask remains the API and UI layer because it is simple and reliable on a Raspberry Pi 4. OCR, remote API calls, image downloads, and matching many candidates can take seconds and use noticeable CPU. Instead of adding Redis, Celery, or another service, this project uses `SimpleJobService`, an in-process `ThreadPoolExecutor`.
-
-The worker/service:
-
-- `scan-worker`: runs the full image-processing pipeline after Flask has saved the JPEG.
-- Purpose: keep heavy OCR, provider fetches, candidate downloads, and OpenCV matching out of the route handler.
-- Why it exists: a Pi 4 can become sluggish if several scans run at once, so the default `SCAN_WORKERS=1` serializes scan work.
-- Tasks that remain in Flask: upload validation, file saving, health checks, job status, history endpoint, and touchscreen UI rendering.
-
-By default, `POST /scan` waits for the worker result so the ESP32-CAM receives the final JSON response. Add `?async=1` or set `BLOCKING_SCAN_RESPONSE=false` to return a queued `job_id` and poll `/jobs/<job_id>`.
-
-## Project Structure
-
-```text
-app.py
-config.py
-requirements.txt
-README.md
-.env.example
-database/
-  init_db.py
-  schema.sql
-  repository.py
-  seed_sample_cards.py
-services/
-  image_matcher.py
-  ocr_service.py
-  card_lookup_service.py
-  candidate_ranker.py
-  scan_pipeline.py
-  display_service.py
-  cache_service.py
-  job_service.py
-  cache_policy.py
-  descriptor_store.py
-  storage_manager.py
-  maintenance_service.py
-providers/
-  base_provider.py
-  pokemon_provider.py
-  onepiece_provider.py
-  mock_provider.py
-routes/
-  scan_routes.py
-  ui_routes.py
-utils/
-  image_utils.py
-  text_utils.py
-  logger.py
-templates/
-  display.html
-  result.html
-static/
-  styles.css
-data/
-  scans/
-  cache/
-    card_images/
-    candidate_temp/
-    scan_debug/
-  descriptors/
-tests/
-  test_image_matcher.py
-  test_text_utils.py
-  test_candidate_ranker.py
-  test_pipeline.py
-```
-
-## Raspberry Pi 4 Setup
-
-Use Python 3.11 or newer. On Raspberry Pi OS, install system packages first:
-
-```bash
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3-pip libgl1 libglib2.0-0
-```
-
-Then set up the project:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python database/init_db.py
-python database/seed_sample_cards.py
-python app.py
-```
-
-The API will listen on `http://0.0.0.0:5000` by default.
-
-## Configuration
-
-Copy `.env.example` to `.env` and adjust values as needed.
-
-Important settings:
-
-- `LOCAL_MATCH_THRESHOLD`: confidence needed to trust the local SQLite/descriptor match.
-- `REMOTE_MATCH_THRESHOLD`: confidence needed to trust a remote provider candidate.
-- `SCAN_WORKERS`: default `1`, recommended for Raspberry Pi 4.
-- `SCANS_MAX_BYTES`: default `1GB`.
-- `IMAGE_CACHE_MAX_BYTES`: default `2GB`.
-- `CANDIDATE_TEMP_MAX_BYTES`: default `512MB`.
-- `DESCRIPTORS_MAX_BYTES`: default `256MB`.
-- `MIN_FREE_SPACE_BYTES`: default `20GB`.
-- `SCAN_ORIGINAL_TTL_DAYS`: default `14`.
-- `CANDIDATE_TEMP_TTL_HOURS`: default `72`.
-- `ENABLE_MOCK_PROVIDER`: keep `true` for offline development.
-- `POKEMON_TCG_API_KEY`: optional for Pokemon TCG API.
-- `ONEPIECE_API_BASE_URL` and `ONEPIECE_API_KEY`: configurable because One Piece APIs vary by provider.
-- `OCR_ENABLED`: set `false` to skip EasyOCR during quick development.
-
-If no remote API credentials are supplied, the project still runs with `MockProvider`.
-
-## ESP32-CAM Upload
-
-The scanner accepts either a multipart file field named `image` or a raw `image/jpeg` request body.
-
-Raw JPEG:
-
-```cpp
-HTTPClient http;
-http.begin("http://RASPBERRY_PI_IP:5000/scan");
-http.addHeader("Content-Type", "image/jpeg");
-int code = http.POST(jpegBuffer, jpegLength);
-String response = http.getString();
-http.end();
-```
-
-Multipart uploads also work if your ESP32-CAM firmware sends `form-data` with the field name `image`.
-
-## Test With Curl
-
-Raw JPEG body:
-
-```bash
-curl -X POST \
-  -H "Content-Type: image/jpeg" \
-  --data-binary @sample-card.jpg \
-  http://RASPBERRY_PI_IP:5000/scan
-```
-
-Multipart:
-
-```bash
-curl -X POST \
-  -F "image=@sample-card.jpg;type=image/jpeg" \
-  http://RASPBERRY_PI_IP:5000/scan
-```
-
-Async mode:
-
-```bash
-curl -X POST \
-  -H "Content-Type: image/jpeg" \
-  --data-binary @sample-card.jpg \
-  "http://RASPBERRY_PI_IP:5000/scan?async=1"
-
-curl http://RASPBERRY_PI_IP:5000/jobs/JOB_ID
-```
-
-## Freenove Touchscreen Display
-
-The Freenove monitor is treated as the Pi display. Start the Flask server, then open Chromium on the Pi:
-
-```bash
-chromium-browser --kiosk http://localhost:5000/display
-```
-
-The `/display` page auto-refreshes and shows:
-
-- card name
-- Pokemon or One Piece
-- set name
-- price
-- confidence
-- match source, such as `local_db` or `remote_api`
-
-The backend updates the display after success, low-confidence results, OCR failures, and pipeline errors.
-
-## API Endpoints
-
-### `GET /health`
-
-Returns:
-
-```json
-{
-  "ok": true,
-  "service": "raspi-card-scanner"
-}
-```
-
-### `POST /scan`
-
-Returns a final result by default:
-
-```json
-{
-  "matched": true,
-  "card_name": "Pikachu",
-  "game": "pokemon",
-  "set_name": "Base Set",
-  "price": 12.34,
-  "currency": "USD",
-  "confidence": 0.67,
-  "source": "local_db",
-  "ocr_text": "",
-  "image_path": "data/scans/scan_20260502T120000000000Z.jpg",
-  "db_id": 123
-}
-```
-
-### `GET /jobs/<job_id>`
-
-Returns queued/running/finished/failed state for async scans.
-
-### `GET /history`
-
-Returns recent scan history rows.
-
-### `GET /display`
-
-Touchscreen UI for the latest scan state.
-
-## Provider Layer
-
-All providers return the same `CandidateCard` schema:
-
-- `game`
-- `card_name`
-- `set_name`
-- `collector_number`
-- `rarity`
-- `image_url`
-- `price`
-- `currency`
-- `source`
-- `api_id`
-
-Included providers:
-
-- `PokemonProvider`: uses the Pokemon TCG API.
-- `OnePieceProvider`: uses a configurable APITCG-compatible endpoint.
-- `MockProvider`: works offline and powers tests/development.
-
-## Database
-
-SQLite database file: `carddata.db`.
-
-Tables:
-
-- `cards`: normalized card records and cached descriptor paths.
-- `card_images`: image references for known cards.
-- `scan_history`: every attempt, including failures and confidence.
-- `api_cache`: provider query cache to reduce network calls.
-- `storage_files`: tier, path, hash, size, expiry, LRU access time, and pinning metadata.
-- `price_history`: compact price observations only when a price changes.
-
-Schema choices:
-
-- Full-size images are not stored as SQLite BLOBs.
-- ORB descriptors are separate `.npz` files, indexed by path in SQLite.
-- Provider-specific raw metadata is stored in `metadata_json` for expandability.
-- New games reuse the same `game`, `api_source`, `api_id`, `storage_files`, and `metadata_json` model.
-
-Price strategy:
-
-- `cards.price` and `cards.currency` hold the latest known value for display.
-- `price_history` stores compact observations only when the value changes.
-- Provider/API prices should be refreshed during OCR/API lookup or by a future scheduled refresh, not on every local DB match.
-- `PRICE_REFRESH_MIN_HOURS=24` is a good default to avoid noisy writes and excessive API calls.
-
-## Startup Maintenance
-
-`MaintenanceService` runs at startup and performs a small bounded cleanup:
-
-- validates all storage directories;
-- removes storage index rows for missing files;
-- prunes expired candidate temp files;
-- prunes old uploaded scan originals;
-- enforces LRU size caps;
-- rebuilds a small number of missing descriptors from available local images.
-
-The scan pipeline interacts with storage like this:
-
-1. `/scan` saves the JPEG through `StorageManager`, which hashes and deduplicates repeated uploads.
-2. Local matching loads existing descriptors from `DescriptorStore`.
-3. OCR/API candidates are downloaded into `candidate_temp`.
-4. The best confident remote match is promoted into `card_images`.
-5. ORB descriptors are generated lazily and stored in `data/descriptors/`.
-6. SQLite records card metadata, file paths, hashes, latest price, scan history, and cache index rows.
-
-## Testing
-
-Run:
-
-```bash
-pytest
-```
-
-The tests use temporary files and the mock provider. They do not require network access or EasyOCR.
+Tests run fully offline: a fake detector, a stub OCR, and the **mock** identity/price
+providers. They need no network, no EasyOCR/torch, and no TCGAPIs key. The suite covers
+the normalizer, the pHash matcher, the ranker, and an end-to-end pipeline run
+(remote match → recent-sales price → subsequent local hit with no duplicate).
+
+> Note: `normalizer.py` uses RapidFuzz when available and falls back to a stdlib
+> `difflib` shim only if it isn't importable, so the app never hard-crashes on a minimal
+> environment. On the Pi, `pip install -r requirements.txt` gives you the real RapidFuzz.
+
+---
+
+## Suggested build order
+
+If you're bringing this up incrementally on the Pi:
+
+1. `POST /scan` that just saves the JPEG + `/health` — prove the ESP32-CAM round-trip.
+2. `card_detector` — eyeball warped crops saved to `data/cache/scan_debug/`.
+3. `ocr_service` + `normalizer` on the number crop → resolve Pokémon by collector number.
+4. `pricing_service` → attach the recent-sales price. **End-to-end value delivered.**
+5. SQLite repository + in-memory index + pHash local matching + caching.
+6. ORB tie-break, One Piece provider, confidence scoring, `/display`.
+7. Maintenance, eviction, metrics, hardening.
