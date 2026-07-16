@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="3">   <!-- auto-refresh for the touchscreen -->
+  <title>Card Scanner</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body class="display">
+  <main class="card {{ 'matched' if state.get('matched') else 'unmatched' }}">
+    {% if state.get('matched') %}
+      <h1 class="name">{{ state.get('card_name') }}</h1>
+      <p class="meta">{{ state.get('game') | capitalize }} · {{ state.get('set_name') }}
+        {% if state.get('collector_number') %}· {{ state.get('collector_number') }}{% endif %}</p>
+      <p class="price">
+        {% if state.get('price') is not none %}
+          ${{ '%.2f' | format(state.get('price')) }}
+        {% else %}
+          <span class="noprice">No price</span>
+        {% endif %}
+      </p>
+      <p class="basis">{{ state.get('price_basis') }}{% if state.get('price_as_of') %} · as of {{ state.get('price_as_of')[:10] }}{% endif %}</p>
+      <p class="conf">confidence {{ '%.0f' | format((state.get('confidence') or 0) * 100) }}% · {{ state.get('source') }}</p>
+    {% else %}
+      <h1 class="name">{{ state.get('best_guess') or 'No match' }}</h1>
+      <p class="meta">{{ state.get('reason') or state.get('message') or 'Waiting for a scan…' }}</p>
+    {% endif %}
+    <p class="ts">{{ state.get('updated_at', '')[:19] | replace('T', ' ') }}</p>
+  </main>
+</body>
+</html>
