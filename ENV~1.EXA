@@ -1,0 +1,52 @@
+# Copy to .env and adjust. Never commit your real .env.
+
+# ---- Server ----
+HOST=0.0.0.0
+PORT=5000
+DEBUG=false
+SCAN_WORKERS=1                # keep at 1 on a Raspberry Pi 4
+BLOCKING_SCAN_RESPONSE=true   # POST /scan waits for the result by default
+SCAN_TASK_TIMEOUT_SEC=30      # hard cap so a hung scan can't wedge the ESP32-CAM
+MAX_UPLOAD_BYTES=12000000     # reject uploads larger than this (~12 MB)
+
+# ---- Matching thresholds (0..1) ----
+LOCAL_MATCH_THRESHOLD=0.72    # confidence needed to trust a local (pHash/ORB) match
+REMOTE_MATCH_THRESHOLD=0.60   # confidence needed to trust a remote provider candidate
+PHASH_MAX_DISTANCE=10         # max Hamming distance (of 64 bits) to consider a pHash hit
+ORB_SHORTLIST=5               # how many top candidates ORB re-ranks as a tie-breaker
+
+# ---- OCR ----
+OCR_ENABLED=true
+OCR_LANGS=en
+OCR_GPU=false                 # Pi has no CUDA GPU
+
+# ---- Card identity + pricing provider (TCGAPIs) ----
+# Docs: https://tcgapis.com/documentation   Auth header: x-api-key
+TCGAPIS_BASE_URL=https://api.tcgapis.com
+TCGAPIS_API_KEY=              # your key; leave blank to run fully on the mock provider
+TCGAPIS_TIMEOUT_SEC=8
+TCGAPIS_MAX_RETRIES=2
+
+# Price definition: derive from real recent sales (sales-history), not just market price.
+# Strategy: last_sale | median_recent | mean_recent
+PRICE_STRATEGY=median_recent
+PRICE_RECENT_SALES_WINDOW=10  # how many most-recent sales to consider for median/mean
+PRICE_FALLBACK_TO_MARKET=true # if sales history is empty, fall back to market price
+PRICE_REFRESH_MIN_HOURS=24    # do not re-fetch a card's price more often than this
+
+# ---- Games to query (comma separated: pokemon,onepiece) ----
+ENABLED_GAMES=pokemon,onepiece
+ENABLE_MOCK_PROVIDER=true      # keep true for offline dev/tests
+
+# ---- Storage caps (bytes) ----
+SCANS_MAX_BYTES=1000000000        # 1 GB
+IMAGE_CACHE_MAX_BYTES=2000000000  # 2 GB
+CANDIDATE_TEMP_MAX_BYTES=512000000
+DESCRIPTORS_MAX_BYTES=256000000
+MIN_FREE_SPACE_BYTES=20000000000  # 20 GB reserve
+SCAN_ORIGINAL_TTL_DAYS=14
+CANDIDATE_TEMP_TTL_HOURS=72
+
+# ---- Paths ----
+DB_PATH=carddata.db
+DATA_DIR=data
